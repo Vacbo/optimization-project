@@ -25,6 +25,7 @@ import System.Random (randomR, StdGen, mkStdGen, randomIO)
 import Prelude hiding (length)
 -- import Data.Maybe (listToMaybe) -- Unused
 import Control.Monad (foldM)
+import Data.Maybe (Maybe(..), catMaybes)
 
 -- | Generate all combinations of k elements from a list
 combinations :: Int -> [a] -> [[a]]
@@ -48,25 +49,27 @@ generateDirichletWeights n alpha gen =
       total = sum gammas
   in (V.fromList $ map (/ total) gammas, gen')
 
--- | Generate valid weights with adaptive alpha
-generateValidWeights :: Int -> IO (V.Vector Double)
-generateValidWeights n = do
-  -- Create a random number generator with a random seed
-  seed <- randomIO
-  let gen = mkStdGen seed
-  -- Start with alpha that favors more concentrated weights
-  let initialAlpha = 0.5
-  let (weights, gen') = generateDirichletWeights n initialAlpha gen
-  
-  if V.all (<= 0.2) weights
-    then return weights
-    else do
-      -- If weights are invalid, try with a different alpha
-      -- that favors more spread out weights
-      let (weights', _) = generateDirichletWeights n (initialAlpha * 2) gen'
-      if V.all (<= 0.2) weights'
-        then return weights'
-        else generateValidWeights n  -- Fall back to recursion if needed
+-- | Generate valid weights with adaptive alpha and a retry limit.
+-- Returns Nothing if unable to generate valid weights within the limit.
+generateValidWeights :: Int -> Int -> IO (Maybe (V.Vector Double))
+generateValidWeights n maxAttempts
+  | maxAttempts <= 0 = return Nothing -- Base case: exceeded attempts
+  | otherwise = do
+      seed <- randomIO
+      let gen = mkStdGen seed
+      -- Try initial alpha
+      let initialAlpha = 0.5 
+      let (weights, gen') = generateDirichletWeights n initialAlpha gen
+      
+      if V.all (<= 0.2) weights
+        then return (Just weights)
+        else do
+          -- If weights are invalid, try with a different alpha
+          let (weights', _) = generateDirichletWeights n (initialAlpha * 2) gen'
+          if V.all (<= 0.2) weights'
+            then return (Just weights')
+            -- Decrement attempts and recurse
+            else generateValidWeights n (maxAttempts - 1) 
 
 -- | Calculate portfolio return using cached mean returns
 portfolioReturn :: V.Vector Double -> V.Vector Double -> Double
@@ -123,52 +126,52 @@ selectSubCovarianceMatrix :: V.Vector (V.Vector Double) -> [Int] -> V.Vector (V.
 selectSubCovarianceMatrix fullCovMatrix assetIndices =
   V.fromList $ map (\i -> V.fromList [ (fullCovMatrix V.! i) V.! j | j <- assetIndices]) assetIndices
 
--- | Simulate a single portfolio using cached metrics
-simulatePortfolioWithStocks :: V.Vector Text -> V.Vector (V.Vector Double) -> V.Vector (V.Vector Double) -> IO (Double, Double, Double, V.Vector Double)
-simulatePortfolioWithStocks stocks returnsMatrix covMatrix = do
-  weights <- generateValidWeights (V.length stocks)
-  let portfolioReturns = V.map (portfolioReturn weights) returnsMatrix
-      meanDailyReturn = V.sum portfolioReturns / fromIntegral (V.length portfolioReturns)
-      dailyVolatility = portfolioVolatility weights covMatrix
-      -- Annualize returns and volatility
-      annualizedReturn = meanDailyReturn * 252
-      annualizedVolatility = dailyVolatility * sqrt 252
-      sharpe = calculateSharpeRatio annualizedReturn annualizedVolatility 0.0  -- Assuming 0% risk-free rate
-  -- Force evaluation of results before returning tuple
-  let !ar = annualizedReturn
-      !av = annualizedVolatility
-      !s = sharpe
-      !w = weights
-  return (ar, av, s, w)
+-- | Simulate a single portfolio using cached metrics.
+-- Returns Maybe tuple, signalling failure if weights couldn't be generated.
+simulatePortfolioWithStocks :: Int -- Max weight generation attempts
+                          -> V.Vector Text 
+                          -> V.Vector (V.Vector Double) 
+                          -> V.Vector (V.Vector Double) 
+                          -> IO (Maybe (Double, Double, Double, V.Vector Double))
+simulatePortfolioWithStocks maxWeightAttempts stocks returnsMatrix covMatrix = do
+  maybeWeights <- generateValidWeights (V.length stocks) maxWeightAttempts
+  case maybeWeights of
+    Nothing -> return Nothing -- Failed to generate valid weights
+    Just weights -> do
+      let portfolioReturns = V.map (portfolioReturn weights) returnsMatrix
+          meanDailyReturn = V.sum portfolioReturns / fromIntegral (V.length portfolioReturns)
+          dailyVolatility = portfolioVolatility weights covMatrix
+          -- Annualize returns and volatility
+          annualizedReturn = meanDailyReturn * 252
+          annualizedVolatility = dailyVolatility * sqrt 252
+          sharpe = calculateSharpeRatio annualizedReturn annualizedVolatility 0.0
+      -- Force evaluation
+      let !ar = annualizedReturn
+          !av = annualizedVolatility
+          !s = sharpe
+          !w = weights
+      return (Just (ar, av, s, w))
 
--- | Simulate multiple portfolios sequentially for a given stock combination, returning only the best result.
-simulatePortfolios :: Int 
+-- | Simulate multiple portfolios sequentially, returning only the best valid result found.
+simulatePortfolios :: Int -- nPortfolios
+                   -> Int -- Max weight generation attempts per simulation
                    -> V.Vector Text 
                    -> V.Vector (V.Vector Double) 
                    -> V.Vector (V.Vector Double) 
-                   -> IO (Maybe (Double, Double, Double, V.Vector Double)) -- Return Maybe the best result
-simulatePortfolios nPortfolios stocks returnsMatrix covMatrix
+                   -> IO (Maybe (Double, Double, Double, V.Vector Double)) -- Best valid result
+simulatePortfolios nPortfolios maxWeightAttempts stocks returnsMatrix covMatrix
   | nPortfolios <= 0 = return Nothing
   | otherwise = do
-      -- Run the first simulation to get an initial best candidate
-      firstResult <- simulatePortfolioWithStocks stocks returnsMatrix covMatrix
-      
-      -- Sequentially run the remaining simulations, keeping track of the best
-      foldM (runAndCompare stocks returnsMatrix covMatrix) firstResult [2..nPortfolios]
-        >>= (return . Just) -- Wrap the final best result in Just
+      -- Run simulations, collecting only valid results (Just values)
+      results <- catMaybes <$> mapM (\_ -> simulatePortfolioWithStocks maxWeightAttempts stocks returnsMatrix covMatrix) [1..nPortfolios]
 
--- Helper function for the fold
-runAndCompare :: V.Vector Text 
-              -> V.Vector (V.Vector Double) 
-              -> V.Vector (V.Vector Double) 
-              -> (Double, Double, Double, V.Vector Double) -- Current best
-              -> Int -- Simulation count (unused, just for fold structure)
-              -> IO (Double, Double, Double, V.Vector Double) -- New best
-runAndCompare stocks returnsMatrix covMatrix currentBest@(_, _, currentBestSharpe, _) _ = do
-    newResult@(_, _, newSharpe, _) <- simulatePortfolioWithStocks stocks returnsMatrix covMatrix
-    if newSharpe > currentBestSharpe
-        then return newResult
-        else return currentBest
+      -- Find the best among the valid results
+      case results of
+          [] -> return Nothing -- No valid simulations succeeded
+          (r:rs) -> return $ Just $ foldl findBetter r rs
+    where
+      findBetter best@(_, _, bestSharpe, _) current@(_, _, currentSharpe, _) =
+        if currentSharpe > bestSharpe then current else best
 
 -- Function to calculate binomial coefficient nCk
 nCk :: Int -> Int -> Integer

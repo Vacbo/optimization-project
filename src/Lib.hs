@@ -115,7 +115,8 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
             let dummyStockNames = V.replicate numToSelect "STOCK" 
             
             -- Run simulations for this combination
-            maybeBestResultForCombo <- S.simulatePortfolios numSimsPerCombo dummyStockNames selectedReturns_Days_x_Stocks selectedCovMatrix_Stocks_x_Stocks
+            let maxWeightAttempts = 10 -- Or choose another limit
+            maybeBestResultForCombo <- S.simulatePortfolios numSimsPerCombo maxWeightAttempts dummyStockNames selectedReturns_Days_x_Stocks selectedCovMatrix_Stocks_x_Stocks
 
             -- Process the best portfolio within this combination
             case maybeBestResultForCombo of

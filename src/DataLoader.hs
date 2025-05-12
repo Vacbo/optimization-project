@@ -75,11 +75,33 @@ loadStockCsv fp = do
       pure V.empty
     Right (_, v) -> pure v
 
+-- | Load and process data efficiently
+loadData :: FilePath -> IO (V.Vector (V.Vector Double))
+loadData filePath = do
+    -- Load and parse the CSV file
+    stockRows <- loadStockCsv filePath
+    
+    -- Assuming stockRows from loadStockCsv are already sorted by date (ascending)
+    -- as per user information. If not, the original sort would be needed.
+    -- let sortedRows = V.modify (\\v -> VAI.sortBy (\\a b -> compare (date a) (date b)) v) stockRows
+    
+    -- Convert to entries and calculate returns
+    -- If stockRows is sorted, and expandRows preserves that order for entries from
+    -- the same date block, then 'entries' should be suitable for calculateReturns
+    let entries = expandRows stockRows -- Pass stockRows directly
+        returns = calculateReturns entries
+    
+    -- Convert returns to matrix format
+    let (_, _, matrix) = returnsToMatrix returns
+    
+    return matrix
+
 -- | Calculate daily returns from a list of stock entries
 calculateReturns :: [StockEntry] -> [(Day, Map.Map Text Double)]
 calculateReturns entries = 
-  let sortedEntries = sortOn entryDate entries
-      groupedByDate = groupBy ((==) `on` entryDate) sortedEntries
+  -- Assuming 'entries' are already sorted by date from loadData's processing
+  -- let sortedEntries = sortOn entryDate entries
+  let groupedByDate = groupBy ((==) `on` entryDate) entries -- Use 'entries' directly
       priceMapByDate = [ case group of
                             (e:_) -> (entryDate e, Map.fromList [(entrySymbol e', entryPrice e') | e' <- group])
                             []    -> error "Empty group in calculateReturns (should not happen)"
@@ -114,22 +136,4 @@ returnsToMatrix returns =
       -- Replace missing returns with the stock's mean return
       filledMatrix = V.zipWith (\row mean -> 
         V.map (\r -> if r == 0.0 then mean else r) row) matrix meanReturns
-  in (dates, allStocks, filledMatrix)
-
--- | Load and process data efficiently
-loadData :: FilePath -> IO (V.Vector (V.Vector Double))
-loadData filePath = do
-    -- Load and parse the CSV file
-    stockRows <- loadStockCsv filePath
-    
-    -- Sort rows by date to ensure chronological order
-    let sortedRows = V.modify (\v -> VAI.sortBy (\a b -> compare (date a) (date b)) v) stockRows
-    
-    -- Convert to entries and calculate returns
-    let entries = expandRows sortedRows
-        returns = calculateReturns entries
-    
-    -- Convert returns to matrix format
-    let (_, _, matrix) = returnsToMatrix returns
-    
-    return matrix 
+  in (dates, allStocks, filledMatrix) 

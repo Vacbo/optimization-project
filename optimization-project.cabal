@@ -6,10 +6,10 @@ cabal-version: 2.2
 
 name:           optimization-project
 version:        0.1.0.0
-description:    Portfolio Optimization Project 
+description:    Please see the README on GitHub at <https://github.com/vacbo/optimization-project#readme>
 homepage:       https://github.com/vacbo/optimization-project#readme
 bug-reports:    https://github.com/vacbo/optimization-project/issues
-author:         Vacbo 
+author:         Vacbo
 maintainer:     example@example.com
 copyright:      2025 Vacbo
 license:        BSD-3-Clause
@@ -25,14 +25,14 @@ source-repository head
 
 library
   exposed-modules:
+      AdvancedCache
+      Cache
+      DataLoader
       Lib
-      , DataLoader
-      , Simulate
-      , Cache
-      , WorkStealing
-      , AdvancedCache
-      , MemoryEfficient
-      , PerformanceMetrics
+      MemoryEfficient
+      PerformanceMetrics
+      Simulate
+      WorkStealing
   other-modules:
       Paths_optimization_project
   autogen-modules:
@@ -41,27 +41,27 @@ library
       src
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
-      base >=4.7 && <5
-    , aeson
+      aeson
+    , async
+    , base >=4.7 && <5
+    , bytestring
+    , cassava
+    , containers
+    , deepseq
     , directory
     , filepath
-    , cassava
-    , bytestring
-    , vector
-    , vector-algorithms
-    , text
-    , time
-    , containers
-    , unordered-containers
-    , random
+    , hashable
+    , mtl
     , mwc-random
     , parallel
-    , async
-    , deepseq
-    , mtl
-    , transformers
-    , hashable
+    , random
     , stm
+    , text
+    , time
+    , transformers
+    , unordered-containers
+    , vector
+    , vector-algorithms
   default-language: Haskell2010
 
 executable optimization-project-exe
@@ -72,21 +72,30 @@ executable optimization-project-exe
       Paths_optimization_project
   hs-source-dirs:
       app
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N -with-rtsopts=-T -O2
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      base >=4.7 && <5
+      aeson
+    , async
+    , base >=4.7 && <5
     , bytestring
     , cassava
-    , optimization-project
-    , vector
-    , random 
-    , mwc-random
-    , parallel
-    , async
+    , containers
     , deepseq
+    , directory
+    , filepath
+    , hashable
     , mtl
-    , transformers
+    , mwc-random
+    , optimization-project
+    , parallel
+    , random
+    , stm
+    , text
     , time
+    , transformers
+    , unordered-containers
+    , vector
+    , vector-algorithms
   default-language: Haskell2010
 
 test-suite optimization-project-test
@@ -100,16 +109,26 @@ test-suite optimization-project-test
       test
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      base >=4.7 && <5
+      aeson
+    , async
+    , base >=4.7 && <5
     , bytestring
     , cassava
-    , optimization-project
-    , vector
-    , random
-    , mwc-random
-    , parallel
-    , async
+    , containers
     , deepseq
+    , directory
+    , filepath
+    , hashable
     , mtl
+    , mwc-random
+    , optimization-project
+    , parallel
+    , random
+    , stm
+    , text
+    , time
     , transformers
+    , unordered-containers
+    , vector
+    , vector-algorithms
   default-language: Haskell2010
