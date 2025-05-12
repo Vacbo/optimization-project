@@ -52,9 +52,12 @@ ghc-options:
 - -Wmissing-home-modules
 - -Wpartial-fields
 - -Wredundant-constraints
+- -O2
 
 library:
   source-dirs: src
+  ghc-options:
+  - -O2
 
 executables:
   optimization-project-exe:
@@ -64,6 +67,7 @@ executables:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
+    - -O2
     dependencies:
     - optimization-project
 

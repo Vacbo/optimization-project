@@ -147,13 +147,20 @@ simulatePortfolioWithStocks maxWeightAttempts stocks returnsMatrix covMatrix = d
   case maybeWeights of
     Nothing -> return Nothing -- Failed to generate valid weights
     Just weights -> do
-      let portfolioReturns = V.map (portfolioReturn weights) returnsMatrix
-          meanDailyReturn = V.sum portfolioReturns / fromIntegral (V.length portfolioReturns)
-          dailyVolatility = portfolioVolatility weights covMatrix
-          -- Annualize returns and volatility
-          annualizedReturn = meanDailyReturn * 252
-          annualizedVolatility = dailyVolatility * sqrt 252
-          sharpe = calculateSharpeRatio annualizedReturn annualizedVolatility 0.0
+      -- Calculate sum of daily returns directly using a strict fold
+      let numDays = V.length returnsMatrix
+      let sumDailyReturns = V.foldl' (\acc dayReturns -> 
+                              acc + portfolioReturn weights dayReturns
+                            ) 0.0 returnsMatrix
+      let meanDailyReturn = if numDays == 0 then 0.0 else sumDailyReturns / fromIntegral numDays
+          
+      -- Calculate volatility (doesn't create large intermediate vector)
+      let dailyVolatility = portfolioVolatility weights covMatrix
+      
+      -- Annualize returns and volatility
+      let annualizedReturn = meanDailyReturn * 252
+      let annualizedVolatility = dailyVolatility * sqrt 252
+      let sharpe = calculateSharpeRatio annualizedReturn annualizedVolatility 0.0
       -- Force evaluation
       let !ar = annualizedReturn
           !av = annualizedVolatility
