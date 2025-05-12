@@ -75,26 +75,14 @@ loadStockCsv fp = do
       pure V.empty
     Right (_, v) -> pure v
 
--- | Load and process data efficiently
-loadData :: FilePath -> IO (V.Vector (V.Vector Double))
+-- | Load and process data efficiently, returning symbols and matrix
+loadData :: FilePath -> IO (V.Vector Text, V.Vector (V.Vector Double))
 loadData filePath = do
-    -- Load and parse the CSV file
     stockRows <- loadStockCsv filePath
-    
-    -- Assuming stockRows from loadStockCsv are already sorted by date (ascending)
-    -- as per user information. If not, the original sort would be needed.
-    -- let sortedRows = V.modify (\\v -> VAI.sortBy (\\a b -> compare (date a) (date b)) v) stockRows
-    
-    -- Convert to entries and calculate returns
-    -- If stockRows is sorted, and expandRows preserves that order for entries from
-    -- the same date block, then 'entries' should be suitable for calculateReturns
-    let entries = expandRows stockRows -- Pass stockRows directly
+    let entries = expandRows stockRows
         returns = calculateReturns entries
-    
-    -- Convert returns to matrix format
-    let (_, _, matrix) = returnsToMatrix returns
-    
-    return matrix
+    let (_, symbols, matrix) = returnsToMatrix returns
+    return (symbols, matrix)
 
 -- | Calculate daily returns from a list of stock entries
 calculateReturns :: [StockEntry] -> [(Day, Map.Map Text Double)]

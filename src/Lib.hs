@@ -19,7 +19,8 @@ import Control.DeepSeq (NFData(..), deepseq)
 import Data.IORef
 import System.IO (hFlush, stdout)
 import Control.Concurrent.Async (mapConcurrently)
-import Data.Foldable (maximumBy)
+import Data.Text (Text)
+import qualified WorkStealing as WS
 
 data PortfolioResult = PortfolioResult {
     weights :: V.Vector Double,
@@ -41,24 +42,24 @@ data OptimizationProgress = OptimizationProgress {
 } deriving (Show)
 
 -- | Optimize portfolio with progress tracking, now parallelizing combinations
-optimizePortfolioWithProgress :: FilePath 
+optimizePortfolioWithProgress :: FilePath
                               -> Int           -- numSimulationsPerCombination
                               -> Int           -- numStocksToSelect (e.g., 25)
-                              -> (OptimizationProgress -> IO ()) 
-                              -> IO [PortfolioResult]
+                              -> (OptimizationProgress -> IO ())
+                              -> IO ([PortfolioResult], V.Vector Text)
 optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallback = do
     putStrLn "[Lib.hs] Loading data..." >> hFlush stdout
-    -- DataLoader.loadData returns a matrix of Stocks x Dates
-    loadedMatrix_Stocks_x_Dates <- DataLoader.loadData filePath 
+    -- DataLoader.loadData returns symbols and matrix
+    (loadedSymbols, loadedMatrix_Stocks_x_Dates) <- DataLoader.loadData filePath
     putStrLn "[Lib.hs] Data loaded." >> hFlush stdout
-    
+
     let numActualStocksLoaded = V.length loadedMatrix_Stocks_x_Dates
     let numActualDatesLoaded = if V.null loadedMatrix_Stocks_x_Dates then 0 else V.length (loadedMatrix_Stocks_x_Dates V.! 0)
 
     putStrLn ("[Lib.hs] Loaded matrix dimensions: " ++ show numActualStocksLoaded ++ " stocks x " ++ show numActualDatesLoaded ++ " dates.") >> hFlush stdout
 
     let targetNumStocksForCombinations = 30 -- As per Dow Jones 30, adjust if needed
-    
+
     let (workingMatrix_Stocks_x_Dates, n_for_nCk) =
           if numActualStocksLoaded == 0 then
               (V.empty, 0)
@@ -68,23 +69,33 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
           else
               -- Use all loaded stocks if fewer than or equal to target
               (loadedMatrix_Stocks_x_Dates, numActualStocksLoaded)
-    
+
+    -- Determine the symbols corresponding to the working matrix
+    let workingSymbols =
+          if numActualStocksLoaded == 0 then
+              V.empty
+          else if numActualStocksLoaded > targetNumStocksForCombinations then
+              V.slice 0 targetNumStocksForCombinations loadedSymbols
+          else
+              loadedSymbols
+
     let numStocksInWorkingSet = V.length workingMatrix_Stocks_x_Dates
     let numDatesInWorkingSet = if V.null workingMatrix_Stocks_x_Dates then 0 else V.length (workingMatrix_Stocks_x_Dates V.! 0)
 
     putStrLn ("[Lib.hs] Working with matrix: " ++ show numStocksInWorkingSet ++ " stocks x " ++ show numDatesInWorkingSet ++ " dates.") >> hFlush stdout
+    putStrLn ("[Lib.hs] Working with symbols: " ++ show (V.length workingSymbols)) >> hFlush stdout
     putStrLn ("[Lib.hs] N for nCk (stocks to choose from): " ++ show n_for_nCk ++ ", K (stocks to select): " ++ show numToSelect) >> hFlush stdout
 
-    when (n_for_nCk == 0 && numToSelect > 0) $ 
+    when (n_for_nCk == 0 && numToSelect > 0) $
         error "Working stock data is empty, but numToSelect > 0."
-    when (n_for_nCk < numToSelect) $ 
+    when (n_for_nCk < numToSelect) $
         error $ "Not enough stocks in working data (" ++ show n_for_nCk ++ ") to select desired number (" ++ show numToSelect ++ ")."
 
     putStrLn "[Lib.hs] Transposing and calculating full covariance matrix for the working set of stocks..." >> hFlush stdout
     -- S.calculateCovarianceMatrix expects (Assets x Days), which is (Stocks x Dates).
     -- So, workingMatrix_Stocks_x_Dates is the correct input format.
     let fullCovMatrix_for_working_set = S.calculateCovarianceMatrix workingMatrix_Stocks_x_Dates
-    
+
     -- S.transposeMatrix: (Stocks x Dates) -> (Dates x Stocks)
     let fullReturnsMatrix_Days_x_Stocks_for_working_set = S.transposeMatrix workingMatrix_Stocks_x_Dates
     putStrLn "[Lib.hs] Full covariance matrix and transposed returns for working set calculated." >> hFlush stdout
@@ -94,28 +105,29 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
     let stockIndexCombinations = S.combinations numToSelect assetIndicesAll
 
     putStrLn ("[Lib.hs] About to call nCk with N: " ++ show n_for_nCk ++ ", k: " ++ show numToSelect) >> hFlush stdout
-    let totalCombinations = fromIntegral (S.nCk n_for_nCk numToSelect) :: Int 
+    let totalCombinations = fromIntegral (S.nCk n_for_nCk numToSelect) :: Int
     putStrLn ("[Lib.hs] Mathematically determined total combinations: " ++ show totalCombinations) >> hFlush stdout
 
-    when (totalCombinations == 0 && numToSelect > 0) $ 
+    when (totalCombinations == 0 && numToSelect > 0) $
         error $ "No combinations possible for selecting " ++ show numToSelect ++ " from " ++ show n_for_nCk ++ ". Check parameters."
-    
+
     -- Use an atomic counter for progress reporting
     completedCombosCounter <- newIORef 0
     overallBestSharpeRef <- newIORef (-1/0) -- Negative infinity
 
     putStrLn "[Lib.hs] Starting parallel processing of combinations..." >> hFlush stdout
-    
+
     -- Define the action to perform for each combination
     let processCombination :: [Int] -> IO (Maybe PortfolioResult)
         processCombination currentIndexCombination = do
             -- Slice matrices for the current combination
             let selectedReturns_Days_x_Stocks = S.selectAssetColumns fullReturnsMatrix_Days_x_Stocks_for_working_set currentIndexCombination
             let selectedCovMatrix_Stocks_x_Stocks = S.selectSubCovarianceMatrix fullCovMatrix_for_working_set currentIndexCombination
-            let dummyStockNames = V.replicate numToSelect "STOCK" 
-            
+            -- Generate dummy stock names based on selection size, actual names are handled later
+            let dummyStockNames = V.replicate (length currentIndexCombination) "DUMMY" 
+
             -- Run simulations for this combination
-            let maxWeightAttempts = 10 -- Or choose another limit
+            let maxWeightAttempts = 50 -- Increased limit
             maybeBestResultForCombo <- S.simulatePortfolios numSimsPerCombo maxWeightAttempts dummyStockNames selectedReturns_Days_x_Stocks selectedCovMatrix_Stocks_x_Stocks
 
             -- Process the best portfolio within this combination
@@ -123,15 +135,15 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
                 Nothing -> pure Nothing -- No valid portfolio found in simulations for this combo
                 Just (bestER, bestRisk, bestSR, bestWeights) -> do
                     let portfolioRes = PortfolioResult {
-                                            weights = bestWeights, 
+                                            weights = bestWeights,
                                             expectedReturn = bestER,
                                             risk = bestRisk,
                                             sharpeRatio = bestSR,
-                                            assetIndices = currentIndexCombination
+                                            assetIndices = currentIndexCombination -- Use the original indices
                                         }
                     -- Update overall best SR atomically
                     atomicModifyIORef' overallBestSharpeRef (\currentBest -> (max currentBest bestSR, ()))
-                    
+
                     -- Increment completed counter and report progress
                     completedCount <- atomicModifyIORef' completedCombosCounter (\c -> (c+1, c+1))
                     currentOverallBestSR <- readIORef overallBestSharpeRef
@@ -142,22 +154,21 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
                         totalBatches = totalCombinations,
                         currentMetrics = bestSR -- SR of the best portfolio found in *this* combination
                     }
-                    
+
                     pure $ Just portfolioRes
 
-    -- Run combinations in parallel
-    -- Need to force evaluation of the list of combinations if it's lazy and shared across threads implicitly
-    -- S.combinations should produce a list. Evaluate it fully first? Or mapConcurrently handles it?
-    -- Let's assume mapConcurrently handles list chunks well enough.
-    maybeBestPortfolios <- mapConcurrently processCombination stockIndexCombinations
+    -- Use work stealing instead
+    putStrLn "[Lib.hs] Using Work Stealing for parallel processing..." >> hFlush stdout
+    maybeBestPortfolios <- WS.processWithWorkStealing processCombination stockIndexCombinations
 
     -- Filter out Nothings and sort the final results
     let finalResults = catMaybes maybeBestPortfolios
     putStrLn "\n[Lib.hs] Parallel processing complete. Final sorting..." >> hFlush stdout
-    return $ sortBy (flip $ comparing sharpeRatio) finalResults
+    -- Return results AND the symbols for the working set
+    return (sortBy (flip $ comparing sharpeRatio) finalResults, workingSymbols)
 
 
-optimizePortfolio :: FilePath -> Int -> Int -> IO [PortfolioResult]
+optimizePortfolio :: FilePath -> Int -> Int -> IO ([PortfolioResult], V.Vector Text)
 optimizePortfolio filePath numSimulations numToSelect = do
     optimizePortfolioWithProgress filePath numSimulations numToSelect $ \progress -> do
         let percentValue = if totalBatches progress == 0 then 0.0 else

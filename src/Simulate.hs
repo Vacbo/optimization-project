@@ -24,8 +24,17 @@ import Data.Text (Text)
 import System.Random (randomR, StdGen, mkStdGen, randomIO)
 import Prelude hiding (length)
 -- import Data.Maybe (listToMaybe) -- Unused
-import Control.Monad (foldM)
 import Data.Maybe (Maybe(..), catMaybes)
+
+-- Helper to generate N gamma values and the final generator state
+generateNGammas :: Int -> Double -> StdGen -> (V.Vector Double, StdGen)
+generateNGammas n alpha initialGen =
+  go n initialGen []
+  where
+    go 0 g acc = (V.fromList (reverse acc), g)
+    go k g acc = 
+      let (x, g') = gammaRandom alpha g
+      in go (k-1) g' (x:acc)
 
 -- | Generate all combinations of k elements from a list
 combinations :: Int -> [a] -> [[a]]
@@ -40,14 +49,14 @@ gammaRandom alpha gen =
   let (u, gen') = randomR (0, 1) gen
   in (-log u / alpha, gen')  -- For alpha = 1.0, this gives exponential distribution
 
--- | Generate weights using Dirichlet distribution
+-- | Generate weights using Dirichlet distribution (more efficient version)
 generateDirichletWeights :: Int -> Double -> StdGen -> (V.Vector Double, StdGen)
 generateDirichletWeights n alpha gen = 
-  let (gammas, gen') = foldl (\(acc, g) _ -> 
-        let (x, g') = gammaRandom alpha g
-        in (acc ++ [x], g')) ([], gen) [1..n]
-      total = sum gammas
-  in (V.fromList $ map (/ total) gammas, gen')
+  let (gammas, gen') = generateNGammas n alpha gen -- Use the helper
+      total = V.sum gammas
+      -- Handle division by zero if sum is zero (though unlikely with gamma)
+      invTotal = if total == 0 then 0 else 1.0 / total 
+  in (V.map (* invTotal) gammas, gen')
 
 -- | Generate valid weights with adaptive alpha and a retry limit.
 -- Returns Nothing if unable to generate valid weights within the limit.
@@ -152,7 +161,25 @@ simulatePortfolioWithStocks maxWeightAttempts stocks returnsMatrix covMatrix = d
           !w = weights
       return (Just (ar, av, s, w))
 
+-- Helper for simulatePortfolios to find the best result incrementally
+findBestSimulation :: Int -> Int -> V.Vector Text -> V.Vector (V.Vector Double) -> V.Vector (V.Vector Double) -> Maybe (Double, Double, Double, V.Vector Double) -> IO (Maybe (Double, Double, Double, V.Vector Double))
+findBestSimulation 0 _ _ _ _ currentBest = return currentBest -- Base case: simulations done
+findBestSimulation n maxAttempts stocks returnsMatrix covMatrix currentBest = do
+    maybeNewResult <- simulatePortfolioWithStocks maxAttempts stocks returnsMatrix covMatrix
+    let nextBest = case (currentBest, maybeNewResult) of
+                      (Nothing, Just new) -> Just new
+                      (Just best@(_, _, bestSharpe, _), Just new@(_, _, newSharpe, _)) -> 
+                          if newSharpe > bestSharpe then Just new else Just best
+                      (Just best, Nothing) -> Just best
+                      (Nothing, Nothing) -> Nothing
+    -- Force evaluation of the sharpe ratio in the potential new best to avoid space leak
+    case nextBest of
+        Just (_, _, sr, _) -> sr `seq` return ()
+        Nothing -> return ()
+    findBestSimulation (n - 1) maxAttempts stocks returnsMatrix covMatrix nextBest
+
 -- | Simulate multiple portfolios sequentially, returning only the best valid result found.
+--   Uses an incremental approach to avoid storing all results.
 simulatePortfolios :: Int -- nPortfolios
                    -> Int -- Max weight generation attempts per simulation
                    -> V.Vector Text 
@@ -161,17 +188,7 @@ simulatePortfolios :: Int -- nPortfolios
                    -> IO (Maybe (Double, Double, Double, V.Vector Double)) -- Best valid result
 simulatePortfolios nPortfolios maxWeightAttempts stocks returnsMatrix covMatrix
   | nPortfolios <= 0 = return Nothing
-  | otherwise = do
-      -- Run simulations, collecting only valid results (Just values)
-      results <- catMaybes <$> mapM (\_ -> simulatePortfolioWithStocks maxWeightAttempts stocks returnsMatrix covMatrix) [1..nPortfolios]
-
-      -- Find the best among the valid results
-      case results of
-          [] -> return Nothing -- No valid simulations succeeded
-          (r:rs) -> return $ Just $ foldl findBetter r rs
-    where
-      findBetter best@(_, _, bestSharpe, _) current@(_, _, currentSharpe, _) =
-        if currentSharpe > bestSharpe then current else best
+  | otherwise = findBestSimulation nPortfolios maxWeightAttempts stocks returnsMatrix covMatrix Nothing
 
 -- Function to calculate binomial coefficient nCk
 nCk :: Int -> Int -> Integer
