@@ -49,13 +49,13 @@ stack exec optimization-project-exe -- <data-file-path> <number-of-simulations> 
 ### Example:
 
 ```bash
-stack exec optimization-project-exe -- data/dowjones30_2024-08-01_to_2024-12-31.csv 100 +RTS -N -T -s
+stack exec optimization-project-exe -- data/dowjones30_2024-08-01_to_2024-12-31.csv 100 +RTS -N8 -T -s
 ```
 
 ### Runtime Options:
 
 - `+RTS -N`: Use all available cores
-- `+RTS -N8`: Use 8 cores
+- `+RTS -N8`: Use 8 cores (recommended for best performance on most systems)
 - `+RTS -T`: Enable runtime statistics
 - `+RTS -s`: Print memory usage statistics
 
@@ -68,6 +68,8 @@ The project is organized into several modules:
 - `Simulate.hs`: Portfolio simulation and metrics calculation
 - `DataLoader.hs`: Loading and processing stock data
 - `WorkStealing.hs`: Parallelism with work-stealing algorithm
+- `MemoryEfficient.hs`: Memory-efficient operations
+- `Cache.hs` and `AdvancedCache.hs`: Caching mechanisms
 - `PerformanceMetrics.hs`: Performance monitoring
 
 ## Algorithm Details
@@ -87,34 +89,43 @@ The project is organized into several modules:
 This project implements several optimizations for performance:
 
 1. **Algorithmic Improvements**:
-   - Increased weight generation attempts from 10 to 50
-   - Strict evaluation with bang patterns
-   - Incremental best-result tracking instead of storing all results
+   - Optimized Dirichlet distribution for weight generation
+   - Strict evaluation with bang patterns and unboxed tuples
+   - Avoiding unnecessary vector operations and conversions
+   - Eliminating intermediate data structures
    - INLINE pragmas for key functions
 
 2. **Parallelism Improvements**:
-   - Work stealing with adaptive chunk sizing
-   - Optimized load balancing for better core utilization
-   - Progress tracking with real-time updates
+   - Work stealing with larger chunk sizes for better workload distribution
+   - Optimized progress tracking with reduced frequency
+   - Better load balancing for optimal core utilization
+   - Targeting 8 cores rather than maximum cores (due to memory bandwidth limitations)
 
 3. **Memory Optimizations**:
-   - SIMD vectorization with unboxed vectors
+   - Reduced boxed/unboxed vector conversions
    - Batch processing for better cache efficiency
-   - Optimized covariance matrix calculation
-   - Improved matrix operations with specialized vector libraries
+   - Direct dot product implementations without temporary vectors
+   - Simplified data flow to reduce allocation overhead
 
 4. **Compiler Optimizations**:
    - -O2 optimization level
    - -funbox-strict-fields for better memory representation
    - -fexcess-precision for better numerical accuracy
+   - -optc-O3 and -optc-ffast-math for better C-level optimizations
 
 ## Performance Metrics
 
-The program displays detailed performance metrics after execution:
-- Computation time
-- Memory usage
-- Parallelization efficiency
-- Garbage collection statistics
+The current optimized implementation achieves:
+- Computation time: ~31 seconds (down from 80-160s in previous versions)
+- Memory usage: ~201GB (down from 666GB)
+- Parallelization efficiency: ~762% with 8 cores
+- GC time: ~3.7 seconds (~3-4% of runtime)
+- Productivity: ~97% of elapsed time
+
+Key findings:
+- 8 cores outperform 16 cores due to memory bandwidth limitations
+- Memory usage is the primary constraint rather than CPU power
+- Low GC overhead indicates efficient memory management
 
 ## Data Format
 

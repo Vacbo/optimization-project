@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE UnboxedTuples #-}
 
 module Simulate (
     generateValidWeights,
@@ -18,13 +19,22 @@ module Simulate (
 ) where
 
 import qualified Data.Vector as V
-import Data.List (length, tails)
+import qualified Data.Vector.Fusion.Bundle as S
+import qualified Data.Vector.Fusion.Bundle.Monadic as SM
+import Data.List (length, tails, maximumBy)
 import Data.Text (Text)
 -- import Control.Concurrent.Async (mapConcurrently) -- Unused
 import System.Random (randomR, StdGen, mkStdGen, randomIO)
 import Prelude hiding (length)
 -- import Data.Maybe (listToMaybe) -- Unused
-import Data.Maybe (Maybe(..), catMaybes)
+import Data.Maybe (mapMaybe)
+import Data.Ord (comparing)
+import Control.Monad (replicateM, foldM)
+
+{-# INLINE portfolioReturn #-}
+{-# INLINE portfolioVolatility #-}
+{-# INLINE calculateSharpeRatio #-}
+{-# INLINE weightedDot #-}
 
 -- Helper to generate N gamma values and the final generator state
 generateNGammas :: Int -> Double -> StdGen -> (V.Vector Double, StdGen)
@@ -62,54 +72,72 @@ generateDirichletWeights n alpha gen =
 -- Returns Nothing if unable to generate valid weights within the limit.
 generateValidWeights :: Int -> Int -> IO (Maybe (V.Vector Double))
 generateValidWeights n maxAttempts
+  | n <= 0 = return Nothing  -- Invalid asset count
   | maxAttempts <= 0 = return Nothing -- Base case: exceeded attempts
   | otherwise = do
       seed <- randomIO
-      let gen = mkStdGen seed
-      -- Try initial alpha
-      let initialAlpha = 0.5 
-      let (weights, gen') = generateDirichletWeights n initialAlpha gen
+      let initialGen = mkStdGen seed
+      let tryWithAlpha alpha attempts currGen =
+            if attempts <= 0 
+            then Nothing  -- Exhausted attempts
+            else
+              let (weights, nextGen) = generateDirichletWeights n alpha currGen
+                  isValid = V.all (<= 0.2) weights
+              in if isValid
+                 then Just weights
+                 else tryWithAlpha (alpha * 1.5) (attempts - 1) nextGen  -- Increase alpha to make weights more uniform
       
-      if V.all (<= 0.2) weights
-        then return (Just weights)
-        else do
-          -- If weights are invalid, try with a different alpha
-          let (weights', _) = generateDirichletWeights n (initialAlpha * 2) gen'
-          if V.all (<= 0.2) weights'
-            then return (Just weights')
-            -- Decrement attempts and recurse
-            else generateValidWeights n (maxAttempts - 1) 
+      -- Start with a lower alpha for diverse weights, but not too low
+      -- First try with initial alpha, then progressively increase to make weights more uniform
+      case tryWithAlpha 0.4 maxAttempts initialGen of
+        Just w -> return (Just w)
+        Nothing -> return Nothing
 
--- | Calculate portfolio return using cached mean returns
+-- | Optimized dot product for portfolio calculations
+weightedDot :: V.Vector Double -> V.Vector Double -> Double
+weightedDot !v1 !v2 = 
+    -- Direct dot product without temporary vectors
+    V.foldl' (+) 0 $ V.zipWith (*) v1 v2
+
+-- | Calculate portfolio return using cached mean returns (optimized)
 portfolioReturn :: V.Vector Double -> V.Vector Double -> Double
-portfolioReturn weights returns =
-  let dailyReturn = V.sum $ V.zipWith (*) weights returns
-  in dailyReturn  -- Return daily return, annualization happens in simulatePortfolio
+portfolioReturn !weights !returns = weightedDot weights returns
 
--- | Calculate portfolio volatility using cached covariance matrix
+-- | Calculate portfolio volatility using cached covariance matrix (optimized)
 portfolioVolatility :: V.Vector Double -> V.Vector (V.Vector Double) -> Double
-portfolioVolatility weights covMatrix =
-  let weightedCov = V.map (V.sum . V.zipWith (*) weights) covMatrix
-      variance = V.sum $ V.zipWith (*) weights weightedCov
-      dailyVolatility = sqrt variance
-  in dailyVolatility  -- Return daily volatility, annualization happens in simulatePortfolio
+portfolioVolatility !weights !covMatrix =
+    let !weightedCov = V.map (\row -> weightedDot weights row) covMatrix
+        !variance = weightedDot weights weightedCov
+    in sqrt variance
 
 -- | Calculate Sharpe Ratio
 calculateSharpeRatio :: Double -> Double -> Double -> Double
-calculateSharpeRatio meanReturn volatility riskFreeRate =
-  if volatility == 0 then 0 else (meanReturn - riskFreeRate) / volatility
+calculateSharpeRatio !meanReturn !volatility !riskFreeRate =
+  if volatility <= 0.00001 then 0 else (meanReturn - riskFreeRate) / volatility
 
 -- Function to calculate the covariance matrix from a returns matrix (assets in columns)
 calculateCovarianceMatrix :: V.Vector (V.Vector Double) -> V.Vector (V.Vector Double)
 calculateCovarianceMatrix returnsMatrixByCol =
   let numAssets = V.length returnsMatrixByCol
-      numDays = V.length (returnsMatrixByCol V.! 0)
-      means = V.map (\assetReturns -> V.sum assetReturns / fromIntegral numDays) returnsMatrixByCol
-      centeredReturns = V.generate numAssets $ \j ->
-                          V.map (\ret -> ret - (means V.! j)) (returnsMatrixByCol V.! j)
+      numDays = if numAssets > 0 then V.length (returnsMatrixByCol V.! 0) else 0
+      
+      -- Calculate means efficiently
+      means = V.map (\assetReturns -> 
+                      V.foldl' (+) 0 assetReturns / fromIntegral numDays)
+                    returnsMatrixByCol
+      
+      -- Calculate covariance directly
       covariance i j =
-        let sumProd = V.sum $ V.zipWith (*) (centeredReturns V.! i) (centeredReturns V.! j)
-        in sumProd / fromIntegral (numDays - 1) -- Use sample covariance
+        let assetI = returnsMatrixByCol V.! i
+            assetJ = returnsMatrixByCol V.! j
+            meanI = means V.! i
+            meanJ = means V.! j
+            -- Inline the calculation without temporary vectors
+            sumProd = V.foldl' (\acc (xi, xj) -> 
+                            acc + (xi - meanI) * (xj - meanJ))
+                     0 $ V.zip assetI assetJ
+        in sumProd / fromIntegral (numDays - 1)  -- Sample covariance
+      
   in V.generate numAssets $ \i ->
        V.generate numAssets $ \j -> covariance i j
 
@@ -146,47 +174,25 @@ simulatePortfolioWithStocks maxWeightAttempts stocks returnsMatrix covMatrix = d
   maybeWeights <- generateValidWeights (V.length stocks) maxWeightAttempts
   case maybeWeights of
     Nothing -> return Nothing -- Failed to generate valid weights
-    Just weights -> do
-      -- Calculate sum of daily returns directly using a strict fold
-      let numDays = V.length returnsMatrix
-      let sumDailyReturns = V.foldl' (\acc dayReturns -> 
-                              acc + portfolioReturn weights dayReturns
-                            ) 0.0 returnsMatrix
-      let meanDailyReturn = if numDays == 0 then 0.0 else sumDailyReturns / fromIntegral numDays
-          
-      -- Calculate volatility (doesn't create large intermediate vector)
-      let dailyVolatility = portfolioVolatility weights covMatrix
+    Just !weights -> do
+      -- Calculate all metrics in one pass with strict evaluation
+      let !numDays = V.length returnsMatrix
+          !sumDailyReturns = V.foldl' (\acc dayReturns -> 
+                              acc + portfolioReturn weights dayReturns) 0.0 returnsMatrix
+          !meanDailyReturn = if numDays == 0 then 0.0 else sumDailyReturns / fromIntegral numDays
+          !dailyVolatility = portfolioVolatility weights covMatrix
+          -- Constants
+          !annualScaleFactor = 252.0
+          !sqrtAnnualFactor = sqrt annualScaleFactor
+          -- Annualized metrics 
+          !annualizedReturn = meanDailyReturn * annualScaleFactor
+          !annualizedVolatility = dailyVolatility * sqrtAnnualFactor
+          !sharpe = calculateSharpeRatio annualizedReturn annualizedVolatility 0.0
       
-      -- Annualize returns and volatility
-      let annualizedReturn = meanDailyReturn * 252
-      let annualizedVolatility = dailyVolatility * sqrt 252
-      let sharpe = calculateSharpeRatio annualizedReturn annualizedVolatility 0.0
-      -- Force evaluation
-      let !ar = annualizedReturn
-          !av = annualizedVolatility
-          !s = sharpe
-          !w = weights
-      return (Just (ar, av, s, w))
+      -- Return fully evaluated result
+      return $! Just $! (annualizedReturn, annualizedVolatility, sharpe, weights)
 
--- Helper for simulatePortfolios to find the best result incrementally
-findBestSimulation :: Int -> Int -> V.Vector Text -> V.Vector (V.Vector Double) -> V.Vector (V.Vector Double) -> Maybe (Double, Double, Double, V.Vector Double) -> IO (Maybe (Double, Double, Double, V.Vector Double))
-findBestSimulation 0 _ _ _ _ currentBest = return currentBest -- Base case: simulations done
-findBestSimulation n maxAttempts stocks returnsMatrix covMatrix currentBest = do
-    maybeNewResult <- simulatePortfolioWithStocks maxAttempts stocks returnsMatrix covMatrix
-    let nextBest = case (currentBest, maybeNewResult) of
-                      (Nothing, Just new) -> Just new
-                      (Just best@(_, _, bestSharpe, _), Just new@(_, _, newSharpe, _)) -> 
-                          if newSharpe > bestSharpe then Just new else Just best
-                      (Just best, Nothing) -> Just best
-                      (Nothing, Nothing) -> Nothing
-    -- Force evaluation of the sharpe ratio in the potential new best to avoid space leak
-    case nextBest of
-        Just (_, _, sr, _) -> sr `seq` return ()
-        Nothing -> return ()
-    findBestSimulation (n - 1) maxAttempts stocks returnsMatrix covMatrix nextBest
-
--- | Simulate multiple portfolios sequentially, returning only the best valid result found.
---   Uses an incremental approach to avoid storing all results.
+-- | Simulate multiple portfolios, now using batch processing for better cache efficiency
 simulatePortfolios :: Int -- nPortfolios
                    -> Int -- Max weight generation attempts per simulation
                    -> V.Vector Text 
@@ -194,8 +200,38 @@ simulatePortfolios :: Int -- nPortfolios
                    -> V.Vector (V.Vector Double) 
                    -> IO (Maybe (Double, Double, Double, V.Vector Double)) -- Best valid result
 simulatePortfolios nPortfolios maxWeightAttempts stocks returnsMatrix covMatrix
-  | nPortfolios <= 0 = return Nothing
-  | otherwise = findBestSimulation nPortfolios maxWeightAttempts stocks returnsMatrix covMatrix Nothing
+    | nPortfolios <= 0 = return Nothing
+    | otherwise = do
+        -- Shared values for all simulations
+        let !numDays = V.length returnsMatrix
+            !annualScaleFactor = 252.0 :: Double
+            !sqrtAnnualFactor = sqrt annualScaleFactor
+        
+        -- Process portfolios incrementally, keeping track of best result
+        foldM (\currentBest simIndex -> do
+            -- Try to generate valid weights
+            maybeWeights <- generateValidWeights (V.length stocks) maxWeightAttempts
+            case maybeWeights of
+                Nothing -> return currentBest
+                Just !weights -> do
+                    -- Calculate metrics
+                    let !sumDailyReturns = V.foldl' (\acc dayReturns -> 
+                                           acc + portfolioReturn weights dayReturns) 0.0 returnsMatrix
+                        !meanDailyReturn = if numDays == 0 then 0.0 else sumDailyReturns / fromIntegral numDays
+                        !dailyVolatility = portfolioVolatility weights covMatrix
+                        -- Annualized metrics 
+                        !annualizedReturn = meanDailyReturn * annualScaleFactor
+                        !annualizedVolatility = dailyVolatility * sqrtAnnualFactor
+                        !sharpe = calculateSharpeRatio annualizedReturn annualizedVolatility 0.0
+                        -- New result
+                        newResult = (annualizedReturn, annualizedVolatility, sharpe, weights)
+                    
+                    -- Update best result if needed
+                    return $ case currentBest of
+                        Nothing -> Just newResult
+                        Just best@(_, _, sr1, _) ->
+                            if sharpe > sr1 then Just newResult else Just best
+            ) Nothing [1..nPortfolios]
 
 -- Function to calculate binomial coefficient nCk
 nCk :: Int -> Int -> Integer

@@ -10,6 +10,12 @@ extra-source-files:
 - README.md
 - CHANGELOG.md
 
+flags:
+  profiling:
+    description: Enable profiling
+    manual: True
+    default: False
+
 # Metadata used when publishing your package
 # synopsis:            Short description of your package
 # category:            Web
@@ -53,11 +59,22 @@ ghc-options:
 - -Wpartial-fields
 - -Wredundant-constraints
 - -O2
+- -funbox-strict-fields
+- -fexcess-precision
+- -optc-O3
+- -optc-ffast-math
 
 library:
   source-dirs: src
   ghc-options:
   - -O2
+  - -funbox-strict-fields
+  - -fexcess-precision
+  - -optc-O3
+  - -optc-ffast-math
+  when:
+  - condition: flag(profiling)
+    ghc-options: []
 
 executables:
   optimization-project-exe:
@@ -68,8 +85,16 @@ executables:
     - -rtsopts
     - -with-rtsopts=-N
     - -O2
+    - -funbox-strict-fields
+    - -fexcess-precision
+    - -optc-O3
+    - -optc-ffast-math
     dependencies:
     - optimization-project
+    when:
+    - condition: flag(profiling)
+      ghc-options:
+      - -fprof-auto
 
 tests:
   optimization-project-test:
