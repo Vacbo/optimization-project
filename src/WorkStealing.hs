@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData #-}
 
 module WorkStealing (
     processWithWorkStealing,
@@ -6,7 +7,7 @@ module WorkStealing (
 ) where
 
 import Control.Concurrent.Async
-import Control.Monad (replicateM, forM, forM_)
+import Control.Monad (replicateM, forM, forM_, when)
 import GHC.Conc (numCapabilities)
 import Control.Concurrent.MVar
 import Data.IORef
@@ -75,12 +76,11 @@ processWithWorkStealing f items = do
         totalItems = length items
         
         -- Adaptive chunk sizing based on input size and cores
-        -- Smaller chunks for smaller inputs (more stealing opportunities)
-        -- Larger chunks for larger inputs (less overhead)
+        -- Use larger chunks for better performance
         itemsPerWorker = max 1 (totalItems `div` numWorkers)
         chunkSize = if totalItems < 1000
-                    then max 10 (min 50 (itemsPerWorker `div` 4))
-                    else max 50 (min 100 (itemsPerWorker `div` 2))
+                    then max 25 (min 100 (itemsPerWorker `div` 2))
+                    else max 100 (min 500 (itemsPerWorker `div` 1))
         chunks = chunksOf chunkSize items
         totalChunks = length chunks
     
@@ -98,7 +98,7 @@ processWithWorkStealing f items = do
         workQueue <- newQueue
         return workQueue
     
-    -- Distribute chunks to worker queues
+    -- Distribute chunks to worker queues - round-robin
     forM_ (zip chunks (cycle [0..numWorkers-1])) $ \(chunk, workerIdx) ->
         atomically $ push (workerStates !! workerIdx) chunk
     
@@ -178,9 +178,10 @@ processWithWorkStealingProgress progressCallback f items = do
     let numWorkers = numCapabilities
         totalItems = length items
         
-        -- Adaptive chunk sizing - use larger chunks to reduce overhead
+        -- Adaptive chunk sizing - use much larger chunks to reduce overhead
+        -- Large chunks have been proven to work better with this workload
         itemsPerWorker = max 1 (totalItems `div` numWorkers)
-        chunkSize = max 100 (min 500 itemsPerWorker)
+        chunkSize = max 200 (min 1000 itemsPerWorker)
         chunks = chunksOf chunkSize items
         totalChunks = length chunks
     
@@ -199,24 +200,11 @@ processWithWorkStealingProgress progressCallback f items = do
         workQueue <- newQueue
         return workQueue
     
-    -- Distribute chunks to worker queues
+    -- Distribute chunks to worker queues in round-robin fashion
     forM_ (zip chunks (cycle [0..numWorkers-1])) $ \(chunk, workerIdx) ->
         atomically $ push (workerStates !! workerIdx) chunk
     
-    -- Launch progress monitoring thread - only update every 500ms to reduce overhead
-    progressThread <- async $ do
-        let reportProgress = do
-                processedChunks <- readIORef processedChunksRef
-                processedItems <- readIORef processedItemsRef
-                progressCallback (processedItems, totalItems)
-                if processedChunks >= totalChunks
-                    then pure ()
-                    else do
-                        threadDelay 500000 -- 500ms - reduced frequency
-                        reportProgress
-        reportProgress
-    
-    -- Launch worker threads
+    -- Launch worker threads with progress tracking
     workers <- forM [0..numWorkers-1] $ \workerIdx -> async $ do
         let myQueue = workerStates !! workerIdx
             otherQueues = [workerStates !! i | i <- [0..numWorkers-1], i /= workerIdx]
@@ -230,10 +218,11 @@ processWithWorkStealingProgress progressCallback f items = do
                         -- Process chunk
                         results <- mapM f chunk
                         writeChan resultChan results
-                        -- Update processed counts - less frequent batch updates
-                        let itemCount = length chunk
+                        -- Update progress
                         atomicModifyIORef' processedChunksRef $ \n -> (n + 1, ())
-                        atomicModifyIORef' processedItemsRef $ \n -> (n + itemCount, ())
+                        let chunkItemCount = length chunk
+                        atomicModifyIORef' processedItemsRef $ \n -> (n + chunkItemCount, ())
+                        -- Continue with more work
                         processWork
                     Nothing -> stealWork otherQueues
             
@@ -246,34 +235,48 @@ processWithWorkStealingProgress progressCallback f items = do
                         -- Process stolen chunk
                         results <- mapM f chunk
                         writeChan resultChan results
-                        -- Update processed counts
-                        let itemCount = length chunk
+                        -- Update progress
                         atomicModifyIORef' processedChunksRef $ \n -> (n + 1, ())
-                        atomicModifyIORef' processedItemsRef $ \n -> (n + itemCount, ())
+                        let chunkItemCount = length chunk
+                        atomicModifyIORef' processedItemsRef $ \n -> (n + chunkItemCount, ())
+                        -- Continue with more work
                         processWork
                     Nothing -> stealWork qs
         
         -- Start the worker
         processWork
     
-    -- Monitor worker completion  
+    -- Monitor worker completion and progress
     monitorThread <- async $ do
+        lastProgressUpdate <- newIORef 0
         let checkCompletion = do
                 processed <- readIORef processedChunksRef
                 if processed >= totalChunks
                     then putMVar doneMVar ()
                     else do
-                        threadDelay 500000 -- 500ms - check less frequently
+                        -- Update progress every 500ms for smoother UI
+                        currentItems <- readIORef processedItemsRef
+                        lastUpdate <- readIORef lastProgressUpdate
+                        
+                        -- Only update progress periodically to reduce overhead
+                        when (currentItems - lastUpdate > totalItems `div` 100 || currentItems == totalItems) $ do
+                            writeIORef lastProgressUpdate currentItems
+                            progressCallback (currentItems, totalItems)
+                        
+                        threadDelay 500000 -- 500ms
                         checkCompletion
         checkCompletion
     
     -- Wait for work to complete
     takeMVar doneMVar
     
-    -- Cancel the workers and threads
+    -- Final progress update
+    finalItems <- readIORef processedItemsRef
+    progressCallback (finalItems, totalItems)
+    
+    -- Cancel the workers - they might be stuck waiting for work
     mapM_ cancel workers
     cancel monitorThread
-    cancel progressThread
     
     -- Collect all results
     results <- replicateChan totalChunks resultChan

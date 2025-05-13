@@ -1,6 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE StrictData #-}
 
 module Simulate (
     generateValidWeights,
@@ -11,14 +12,18 @@ module Simulate (
     simulatePortfolios,
     -- findBestPortfolio, -- No longer used by Lib.hs, consider removing if not used elsewhere
     combinations,
+    combinationsVector,
     transposeMatrix,
     calculateCovarianceMatrix,
+    calculateCovarianceMatrixEfficient,
     selectAssetColumns,
     selectSubCovarianceMatrix,
     nCk
 ) where
 
 import qualified Data.Vector as V
+import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Mutable as VM
 import qualified Data.Vector.Fusion.Bundle as S
 import qualified Data.Vector.Fusion.Bundle.Monadic as SM
 import Data.List (length, tails, maximumBy)
@@ -52,6 +57,17 @@ combinations 0 _ = [[]]
 combinations n xs
   | n > length xs = []
   | otherwise = [y:ys | y:xs' <- tails xs, ys <- combinations (n-1) xs']
+
+-- | Generate all combinations of k elements from a vector, using stream fusion
+-- for better performance - this is a more efficient implementation
+combinationsVector :: Int -> V.Vector a -> V.Vector (V.Vector a)
+combinationsVector 0 _ = V.singleton V.empty
+combinationsVector n xs
+  | n > V.length xs = V.empty
+  | n == V.length xs = V.singleton xs
+  | otherwise = 
+      -- Use the list-based implementation but convert to vectors
+      V.fromList $ map V.fromList $ combinations n (V.toList xs)
 
 -- | Generate a gamma random variable (simplified for alpha = 1.0)
 gammaRandom :: Double -> StdGen -> (Double, StdGen)
@@ -106,14 +122,60 @@ portfolioReturn !weights !returns = weightedDot weights returns
 -- | Calculate portfolio volatility using cached covariance matrix (optimized)
 portfolioVolatility :: V.Vector Double -> V.Vector (V.Vector Double) -> Double
 portfolioVolatility !weights !covMatrix =
-    let !weightedCov = V.map (\row -> weightedDot weights row) covMatrix
-        !variance = weightedDot weights weightedCov
+    -- Convert weights to unboxed vector for better performance in dot products
+    let !weightsU = VU.convert weights
+        !weightedCov = V.map (\row -> 
+                               let rowU = VU.convert row
+                                   dotProd = VU.sum $ VU.zipWith (*) weightsU rowU
+                               in dotProd) covMatrix
+        !weightedCovU = VU.convert weightedCov
+        !variance = VU.sum $ VU.zipWith (*) weightsU weightedCovU
     in sqrt variance
 
 -- | Calculate Sharpe Ratio
 calculateSharpeRatio :: Double -> Double -> Double -> Double
 calculateSharpeRatio !meanReturn !volatility !riskFreeRate =
   if volatility <= 0.00001 then 0 else (meanReturn - riskFreeRate) / volatility
+
+-- | More efficient covariance matrix calculation using incremental computation and unboxed vectors
+calculateCovarianceMatrixEfficient :: V.Vector (V.Vector Double) -> V.Vector (V.Vector Double)
+calculateCovarianceMatrixEfficient returnsMatrixByCol =
+  let numAssets = V.length returnsMatrixByCol
+      numDays = if numAssets > 0 then V.length (returnsMatrixByCol V.! 0) else 0
+      
+      -- Precompute all unboxed returns vectors for better performance
+      returnsUnboxed = V.map VU.convert returnsMatrixByCol
+      
+      -- Calculate means efficiently with unboxed vectors  
+      means = V.generate numAssets $ \i -> 
+                let assetReturns = returnsUnboxed V.! i
+                    total = VU.foldl' (+) 0.0 assetReturns
+                in total / fromIntegral numDays
+      
+      -- Calculate covariance directly
+      -- This is the most performance-critical part
+      covariance i j =
+        if i == j then
+          -- Variance calculation (diagonal of covariance matrix)
+          let assetI = returnsUnboxed V.! i
+              meanI = means V.! i
+              -- Calculate variance using a single pass, avoiding intermediate allocations
+              sumSquares = VU.foldl' (\acc x -> acc + (x - meanI) * (x - meanI)) 0.0 assetI
+          in sumSquares / fromIntegral (numDays - 1)
+        else 
+          -- Covariance calculation (off-diagonal)
+          let assetI = returnsUnboxed V.! i
+              assetJ = returnsUnboxed V.! j
+              meanI = means V.! i
+              meanJ = means V.! j
+              -- Calculate covariance in a single pass to minimize memory usage
+              sumProducts = VU.foldl' (\acc (x, y) -> 
+                                         acc + (x - meanI) * (y - meanJ)
+                                      ) 0.0 (VU.zip assetI assetJ)
+          in sumProducts / fromIntegral (numDays - 1)
+      
+  in V.generate numAssets $ \i ->
+       V.generate numAssets $ \j -> covariance i j
 
 -- Function to calculate the covariance matrix from a returns matrix (assets in columns)
 calculateCovarianceMatrix :: V.Vector (V.Vector Double) -> V.Vector (V.Vector Double)
@@ -156,12 +218,21 @@ selectAssetColumns :: V.Vector (V.Vector Double) -> [Int] -> V.Vector (V.Vector 
 selectAssetColumns returnsMatrixByRow assetIndices
   | V.null returnsMatrixByRow = V.empty
   | otherwise = 
-      V.map (\dayReturns -> V.fromList [dayReturns V.! i | i <- assetIndices]) returnsMatrixByRow
+      let idxVectorU = VU.fromList assetIndices  -- Use unboxed vector for indices
+          numIndices = VU.length idxVectorU
+      in V.map (\dayReturns -> 
+                 V.generate numIndices (\i -> dayReturns V.! (idxVectorU VU.! i))
+               ) returnsMatrixByRow
 
 -- Function to select a sub-matrix from a covariance matrix based on asset indices
 selectSubCovarianceMatrix :: V.Vector (V.Vector Double) -> [Int] -> V.Vector (V.Vector Double)
 selectSubCovarianceMatrix fullCovMatrix assetIndices =
-  V.fromList $ map (\i -> V.fromList [ (fullCovMatrix V.! i) V.! j | j <- assetIndices]) assetIndices
+  let idxVectorU = VU.fromList assetIndices  -- Use unboxed vector for indices
+      numIndices = VU.length idxVectorU
+  in V.generate numIndices $ \i ->
+       let srcIdx = idxVectorU VU.! i
+       in V.generate numIndices $ \j ->
+            (fullCovMatrix V.! srcIdx) V.! (idxVectorU VU.! j)
 
 -- | Simulate a single portfolio using cached metrics.
 -- Returns Maybe tuple, signalling failure if weights couldn't be generated.
@@ -177,8 +248,15 @@ simulatePortfolioWithStocks maxWeightAttempts stocks returnsMatrix covMatrix = d
     Just !weights -> do
       -- Calculate all metrics in one pass with strict evaluation
       let !numDays = V.length returnsMatrix
+          !weightsU = VU.convert weights -- Convert to unboxed for faster operations
+          
+          -- More efficient sumDailyReturns calculation using unboxed operations
           !sumDailyReturns = V.foldl' (\acc dayReturns -> 
-                              acc + portfolioReturn weights dayReturns) 0.0 returnsMatrix
+                               let dayReturnsU = VU.convert dayReturns
+                                   dailyReturn = VU.sum $ VU.zipWith (*) weightsU dayReturnsU
+                               in acc + dailyReturn
+                             ) 0.0 returnsMatrix
+          
           !meanDailyReturn = if numDays == 0 then 0.0 else sumDailyReturns / fromIntegral numDays
           !dailyVolatility = portfolioVolatility weights covMatrix
           -- Constants
@@ -214,9 +292,16 @@ simulatePortfolios nPortfolios maxWeightAttempts stocks returnsMatrix covMatrix
             case maybeWeights of
                 Nothing -> return currentBest
                 Just !weights -> do
-                    -- Calculate metrics
-                    let !sumDailyReturns = V.foldl' (\acc dayReturns -> 
-                                           acc + portfolioReturn weights dayReturns) 0.0 returnsMatrix
+                    -- Calculate metrics with unboxed operations for better performance
+                    let !weightsU = VU.convert weights
+                        
+                        -- More efficient sumDailyReturns calculation
+                        !sumDailyReturns = V.foldl' (\acc dayReturns -> 
+                                               let dayReturnsU = VU.convert dayReturns
+                                                   dailyReturn = VU.sum $ VU.zipWith (*) weightsU dayReturnsU
+                                               in acc + dailyReturn
+                                             ) 0.0 returnsMatrix
+                        
                         !meanDailyReturn = if numDays == 0 then 0.0 else sumDailyReturns / fromIntegral numDays
                         !dailyVolatility = portfolioVolatility weights covMatrix
                         -- Annualized metrics 

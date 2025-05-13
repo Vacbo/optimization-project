@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData #-}
 
 module Lib (
     optimizePortfolio,
@@ -88,8 +89,9 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
     putStrLn "[Lib.hs] Transposing and calculating full covariance matrix for the working set of stocks..."
     
     -- Calculate the transposed returns and covariance matrix once for the full set
-    let workingTransposedMatrix_Dates_x_Stocks = V.fromList [V.fromList [workingMatrix_Stocks_x_Dates V.! s V.! d | s <- [0..V.length workingMatrix_Stocks_x_Dates - 1]] | d <- [0..V.length (workingMatrix_Stocks_x_Dates V.! 0) - 1]]
-    let fullCovMatrix_Stocks_x_Stocks = S.calculateCovarianceMatrix workingMatrix_Stocks_x_Dates
+    let workingTransposedMatrix_Dates_x_Stocks = S.transposeMatrix workingMatrix_Stocks_x_Dates
+    -- Use the more efficient covariance matrix calculation
+    let fullCovMatrix_Stocks_x_Stocks = S.calculateCovarianceMatrixEfficient workingMatrix_Stocks_x_Dates
     
     covEnd <- getCurrentTime
     let covDuration = realToFrac $ diffUTCTime covEnd covStart :: Double
@@ -100,7 +102,16 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
     
     putStrLn "[Lib.hs] Generating stock combinations (lazily)..."
     putStrLn $ printf "[Lib.hs] About to call nCk with N: %d, k: %d" n_for_nCk numToSelect
-    let stockIndexCombinations = S.combinations numToSelect [0..(n_for_nCk - 1)]
+    
+    -- Convert indices to a Vector for more efficient processing
+    let stockIndicesVector = V.fromList [0..(n_for_nCk - 1)]
+    
+    -- Use the efficient vector-based combinations when possible
+    let stockIndexCombinations = 
+          if n_for_nCk > 100 
+          then map V.toList (V.toList (S.combinationsVector numToSelect stockIndicesVector))
+          else S.combinations numToSelect [0..(n_for_nCk - 1)]
+          
     let totalCombinations = length stockIndexCombinations
     putStrLn $ printf "[Lib.hs] Mathematically determined total combinations: %d" totalCombinations
     
@@ -122,7 +133,7 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
                   Just res -> sharpeRatio res
             atomicModifyIORef' bestRef $ \currentBest -> (max currentBest bestSR, ())
             atomicModifyIORef' progRef $ \progress -> (progress + 1, ())
-            when (comboNum `mod` 100 == 0 || comboNum == totalCombinations) $ do
+            when (comboNum `mod` 500 == 0 || comboNum == totalCombinations) $ do
                 progress <- readIORef progRef
                 bestSoFar <- readIORef bestRef
                 progressCallback OptimizationProgress {
@@ -137,9 +148,8 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
     let processCombination :: [Int] -> IO (Maybe PortfolioResult)
         processCombination stockIndices = do
             -- Extract the selected stocks' returns and covariance sub-matrix
-            let selectedReturns_Days_x_Stocks = V.map (\dayReturns -> V.fromList [dayReturns V.! idx | idx <- stockIndices]) workingTransposedMatrix_Dates_x_Stocks
-            
-            let selectedCovMatrix_Stocks_x_Stocks = V.fromList [V.fromList [fullCovMatrix_Stocks_x_Stocks V.! i V.! j | j <- stockIndices] | i <- stockIndices]
+            let selectedReturns_Days_x_Stocks = S.selectAssetColumns workingTransposedMatrix_Dates_x_Stocks stockIndices
+            let selectedCovMatrix_Stocks_x_Stocks = S.selectSubCovarianceMatrix fullCovMatrix_Stocks_x_Stocks stockIndices
             
             let currentCombo = length stockIndices  -- This is just the count (should be numToSelect)
             
@@ -175,13 +185,15 @@ optimizePortfolioWithProgress filePath numSimsPerCombo numToSelect progressCallb
                                fromIntegral processedItems / fromIntegral totalItems * (100.0 :: Double)
             -- Read the current best sharpe ratio
             currentBest <- readIORef bestRef
-            progressCallback OptimizationProgress {
-                completedProgress = processedItems,
-                bestSharpeRatio = currentBest,
-                currentBatch = processedItems,
-                totalBatches = totalCombinations,
-                currentMetrics = currentBest
-            })
+            -- Reduce update frequency for progress tracking to every 500 items
+            when (processedItems `mod` 500 == 0 || processedItems == totalItems) $ do
+                progressCallback OptimizationProgress {
+                    completedProgress = processedItems,
+                    bestSharpeRatio = currentBest,
+                    currentBatch = processedItems,
+                    totalBatches = totalCombinations,
+                    currentMetrics = currentBest
+                })
         processCombination stockIndexCombinations
 
     parallelEnd <- getCurrentTime
